@@ -1627,6 +1627,11 @@ func (x *myFtlServer) TakePacket(inf *log.Logger, dbg *log.Logger, pkt []byte) b
 	err = p.Unmarshal(pkt)
 	if err != nil {
 		x.badrtp++
+		if strings.Contains(err.Error(), "RTP header size insufficient") {
+			// Ignore RTP header size insufficient errors
+			return true
+		}
+		elog.Println("Got error ", err)
 		return true //ignore and keep connection open
 	}
 
