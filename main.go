@@ -10,6 +10,7 @@ import (
 	"errors"
 	"math/rand"
 	"net"
+	"path"
 	"strconv"
 
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"runtime"
 
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -44,10 +46,11 @@ import (
 
 	redigo "github.com/gomodule/redigo/redis"
 
+	"net/http/httputil"
 	_ "net/http/pprof"
 )
 
-var lastVideoRxTime time.Time
+var lastVideoRxTime time.Time = time.Now()
 
 var sendingIdleVid bool
 
@@ -93,7 +96,7 @@ type MsgSubscriberAddTrack struct {
 	txtrack *TxTrack
 }
 
-var rxMediaCh chan MsgRxPacket = make(chan MsgRxPacket, 10)
+var rxMediaCh chan MsgRxPacket = make(chan MsgRxPacket, 1000)
 var subAddTrackCh chan MsgSubscriberAddTrack = make(chan MsgSubscriberAddTrack, 10)
 
 //var rxidStateCh chan MsgGetRxidState = make(chan MsgGetRxidState)
@@ -183,11 +186,70 @@ func init() {
 	go logGoroutineCountToDebugLog()
 }
 
+func idleExitFunc() {
+	for {
+		if time.Since(lastVideoRxTime) > *idleExitDuration {
+			elog.Printf("Input video idle for %s, exiting", *idleExitDuration)
+			os.Exit(0)
+		}
+		time.Sleep(time.Second * 2)
+	}
+}
+
+func rtpReceiver() {
+
+	var err error
+
+	pconn, err := net.ListenPacket("udp", *rtprx)
+	checkFatal(err)
+	defer pconn.Close()
+
+	c := pconn.(*net.UDPConn)
+
+	buf := make([]byte, 2000)
+
+	for {
+
+		var p rtp.Packet
+
+		n, err := c.Read(buf)
+		if err != nil {
+			continue // silent ignore
+		}
+
+		if len(buf) < 12 {
+			continue //silent ignore
+		}
+
+		b := make([]byte, n)
+		// this is necessary! pkt.raw/[]byte we chan-send gets modified
+		// and next iteration of this loop will overwrite 'buf'
+		copy(b, buf[:n])
+
+		err = p.Unmarshal(b)
+		if err != nil {
+			continue //silent ignore
+		}
+
+		switch p.Header.PayloadType {
+		case 96:
+			rxMediaCh <- MsgRxPacket{rxid: Video, packet: &p, rxClockRate: 90000}
+		case 97:
+			rxMediaCh <- MsgRxPacket{rxid: Audio, packet: &p, rxClockRate: 48000}
+		}
+
+	}
+}
+
 func main() {
 	println("deadsfu Version " + Version)
 
 	conf := parseFlags()
 	oneTimeFlagsActions(&conf) //if !strings.HasSuffix(os.Args[0], ".test") {
+
+	if *idleExitDuration > time.Duration(0) {
+		go idleExitFunc()
+	}
 
 	if *clusterMode {
 
@@ -230,6 +292,12 @@ func main() {
 		panic("no")
 	}
 
+	if *rtprx != "" {
+
+		go rtpReceiver()
+
+	}
+
 	if *ftlKey != "" {
 
 		ftludp, err := net.ListenPacket("udp", ":0")
@@ -266,7 +334,7 @@ func main() {
 			for {
 				err = ingressSemaphore.Acquire(context.Background(), 1)
 				checkFatal(err)
-				log.Println("dial: got sema, dialing upstream")
+				elog.Println("dial: Dialing upstream (got semaphore)")
 				dialUpstream(*dialIngressURL)
 			}
 		}()
@@ -286,26 +354,163 @@ func main() {
 	println("profiling done, exit")
 }
 
-func setupMux(conf SfuConfig) (*http.ServeMux, error) {
-	var err error
+// if a user accidentially sends an SDP to something other than /pub or /sub
+// tell them! we are supposed to be the dead-simple sfu. lol
+func sdpWarning(wrappedHandler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
-	mux := http.NewServeMux()
-
-	if !*disableHtml {
-
-		var f fs.FS
-
-		if *htmlFromDiskFlag {
-			f = os.DirFS("html")
-		} else {
-			f, err = fs.Sub(htmlContent, "html")
-			if err != nil {
-				return nil, fmt.Errorf("fs.sub %w", err)
-			}
-			checkFatal(err)
+		if r.Method != "POST" {
+			wrappedHandler.ServeHTTP(w, r)
+			return
 		}
 
-		mux.Handle("/", http.FileServer(http.FS(f)))
+		buf, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			teeErrorStderrHttp(w, err)
+			return
+		}
+
+		// https://stackoverflow.com/a/23077519/86375
+		r.Body = ioutil.NopCloser(bytes.NewBuffer(buf))
+
+		str := string(buf)
+
+		sdpSignature := strings.HasPrefix(str, "v=0")
+		if sdpSignature {
+			msg := fmt.Errorf("WebRTC SDPs should only be sent to /pub, or /sub, not: %s", r.URL.EscapedPath())
+			teeErrorStderrHttp(w, msg)
+			return
+		}
+
+		wrappedHandler.ServeHTTP(w, r)
+
+	})
+}
+
+// sdpHandler
+// This allows answer/offer SDPs to be posted to /
+// and then routed to subHandler or pubHandler
+// it might make it simpler for new developers, they
+// can just post their SDPs to /, instead of /sub or /pub
+// BUT it might make debugging tricker, because
+// if they don't get their sendonly attributes on the
+// publisher-SDP correct, this code won't
+// route the request to the correct place.
+// **Do not integrate for that reason at this time.**
+//
+var _ = sdpHandler
+
+func sdpHandler(wrappedHandler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		if r.Method != "POST" || r.URL.Path != "/" {
+			wrappedHandler.ServeHTTP(w, r)
+			return
+		}
+
+		buf, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			teeErrorStderrHttp(w, err)
+			return
+		}
+
+		// https://stackoverflow.com/a/23077519/86375
+		r.Body = ioutil.NopCloser(bytes.NewBuffer(buf))
+
+		// do my checking
+		{
+			str := string(buf)
+
+			sdpSignature := strings.HasPrefix(str, "v=0")
+			if sdpSignature {
+				pline()
+
+				rtcsd := &webrtc.SessionDescription{}
+
+				sd, err := rtcsd.Unmarshal()
+				if err != nil {
+					teeErrorStderrHttp(w, err)
+					return
+				}
+
+				sendonly := true
+
+				for _, v := range sd.MediaDescriptions {
+					_, ok := v.Attribute("sendonly")
+					sendonly = sendonly && ok
+				}
+
+				if sendonly {
+					pline()
+					pubHandler(w, r)
+					return
+				} else {
+					pline()
+					SubHandler(w, r)
+					return
+				}
+
+			}
+
+		}
+
+		wrappedHandler.ServeHTTP(w, r)
+
+	})
+}
+
+func setupMux(conf SfuConfig) (*http.ServeMux, error) {
+
+	mux := http.NewServeMux()
+	mux.HandleFunc(subPath, SubHandler)
+	dialingout := *dialIngressURL != ""
+	if !dialingout {
+		mux.HandleFunc(pubPath, pubHandler)
+	}
+
+	if *htmlSource == "" {
+		Usage()
+		os.Exit(-1)
+	}
+
+	httpPrefix := strings.HasPrefix(*htmlSource, "http://")
+	httpsPrefix := strings.HasPrefix(*htmlSource, "https://")
+
+	if *htmlSource == "none" {
+		return mux, nil
+	} else if *htmlSource == "internal" {
+		f, err := fs.Sub(htmlContent, "html")
+		checkFatal(err)
+
+		rootmux := sdpWarning(http.FileServer(http.FS(f)))
+		mux.Handle("/", rootmux)
+
+	} else if httpPrefix || httpsPrefix {
+
+		u, err := url.Parse(*htmlSource)
+		checkFatal(err)
+		rp := httputil.NewSingleHostReverseProxy(u)
+		mux.Handle("/", rp)
+
+	} else {
+
+		s, err := os.Stat(*htmlSource)
+		checkFatal(err)
+		if !s.IsDir() {
+			checkFatal(fmt.Errorf("--html <path>, must refer to a directory when using filepath: %s", *htmlSource))
+		}
+
+		if _, err := os.Stat(path.Join(*htmlSource, "index.html")); os.IsNotExist(err) {
+			checkFatal(fmt.Errorf("--html <path>, must point to dir containing index.html: %s", *htmlSource))
+		}
+
+		f := os.DirFS(*htmlSource)
+		rootmux := sdpWarning(http.FileServer(http.FS(f)))
+		mux.Handle("/", rootmux)
+
+	}
+
+	if false {
 		mux.HandleFunc("/ipv4", func(rw http.ResponseWriter, r *http.Request) {
 			x, err := getDefRouteIntfAddrIPv4()
 			if err == nil {
@@ -319,13 +524,6 @@ func setupMux(conf SfuConfig) (*http.ServeMux, error) {
 			}
 		})
 
-	}
-	mux.HandleFunc(subPath, SubHandler)
-
-	dialingout := *dialIngressURL != ""
-
-	if !dialingout {
-		mux.HandleFunc(pubPath, pubHandler)
 	}
 
 	return mux, nil
@@ -1573,7 +1771,7 @@ func startFtlListener(inf *log.Logger, dbg *log.Logger) {
 		inf.Println("ftl/socket accepted")
 
 		tcpconn := netconn.(*net.TCPConn)
-		ftlserver.NewTcpSession(inf, dbg, tcpconn, findserver)
+		ftlserver.NewTcpSession(inf, dbg, tcpconn, findserver, *ftlUdpPort)
 		netconn.Close()
 	}
 	// unreachable
@@ -1685,6 +1883,8 @@ func isMysteryOBSFTL(p rtp.Packet) (ok bool) {
 	}
 	return true
 }
+
+var _ = clusterSniRedisRegister
 
 func clusterSniRedisRegister(ctx context.Context, domain string, myip net.IP, port int) {
 

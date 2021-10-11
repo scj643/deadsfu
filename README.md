@@ -22,12 +22,14 @@
 
 - [Feature List](#feature-list)
 - [Install](#install)
-- [Quick Start: Under construction!](#quick-start-under-construction)
+- [Quick Start: OBS / FTL ingress](#quick-start-obs--ftl-ingress)
+- [Quick Start: Browser Ingress](#quick-start-browser-ingress)
 - [Getting Support](#getting-support)
 - [Email Newsletter](#email-newsletter)
 - [Contributing](#contributing)
 - [Getting Latest Updates](#getting-latest-updates)
 - [Compile From Source](#compile-from-source)
+- [DeadSFU Thanks](#deadsfu-thanks)
 
 <!--
 todo, see also typesense
@@ -87,23 +89,33 @@ Windows
 curl  https://github.com/x186k/deadsfu/releases/latest/download/deadsfu-windows-amd64.zip -sLo tmp && tar -xvf tmp && del tmp
 ```
 
-## Quick Start: Under construction!
+## Quick Start: OBS / FTL ingress
 
 Linux/macOS
 ```bash
-./deadsfu https://tom42.ddns5.com:8443   # change tom42 to something else
+./deadsfu --http :8080 --html internal --ftl-key 123-abc
 ```
 Windows
 ```
-rem change tom42 to something else
-.\\deadsfu.exe https://tom42.ddns5.com:8443
+.\\deadsfu --http :8080 --html internal --ftl-key 123-abc
 ```
-Docker
+Docker Forwarded Ports (Mac,Win,Linux)
 ```bash
-# change tom42 to something else
-docker run --network host x186k/deadsfu /app/main https://tom42.ddns5.com:8443
+docker run -p 127.0.0.1:8080:8080 -p 127.0.0.1:8084:8084/udp -p 127.0.0.1:8084:8084/tcp x186k/deadsfu /app/main --http :8080 --html internal --ftl-key 123-abc
 ```
 
+Docker Host Networking Linux ONLY!
+```bash
+docker run --network host x186k/deadsfu /app/main --http :8080 --html internal --ftl-key 123-abc
+```
+
+## Quick Start: Browser Ingress
+
+#### Not Yet, use the Slack channel
+
+<!-- ## Quick Start: Digital Ocean App
+
+[![Deploy to DO](https://www.deploytodo.com/do-btn-blue.svg)](https://cloud.digitalocean.com/apps/new?repo=https://github.com/x186k/deadsfu/tree/main) -->
 
 
 ## Getting Support
@@ -149,6 +161,19 @@ Build with Go:
 ```bash
 go build .
 ```
+
+## DeadSFU Thanks
+
+- [Sean Dubois](https://github.com/Sean-Der) Creator of Pion
+- [Luis Orlando](https://github.com/OrlandoCo) Pion help code
+- [Juliusz Chroboczek](https://github.com/jech) Pion help and code
+- [Matt Holt](https://github.com/mholt) Creator of Caddy
+- [Francis Lavoie](https://github.com/francislavoie) Caddy maintainer
+- [Alex Williams](https://github.com/llspalex) Louper founder, inspiration.
+- [Sayan Bhattacharya](https://github.com/Thunder80) Louper developer.
+- [Charles Surett](https://github.com/scj643) Early user.
+
+
 
 
 

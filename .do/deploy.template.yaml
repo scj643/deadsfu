@@ -1,0 +1,10 @@
+spec:
+  name: sample-dockerfile
+  services:
+  - dockerfile_path: Dockerfile
+    git:
+      branch: main
+      repo_clone_url: https://github.com/x186k/deadsfu.git
+    name: sample-dockerfile
+
+

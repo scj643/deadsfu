@@ -1,0 +1,9 @@
+name: sample-dockerfile
+services:
+  - name: deadsfu-app
+    image:
+      registry_type: "DOCKER_HUB"
+      registry: "docker.io"
+      repository: "x186k/deadsfu"
+
+
